@@ -103,6 +103,26 @@ db.exec(`
     FOREIGN KEY (member_id) REFERENCES pool_members(id),
     FOREIGN KEY (game_id) REFERENCES games(id)
   );
+CREATE TABLE IF NOT EXISTS password_resets (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  token TEXT UNIQUE NOT NULL,
+  expires_at DATETIME NOT NULL,
+  used INTEGER DEFAULT 0,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id)
+);
+```
+
+**After your existing login route**, paste in all three routes from the **Password Reset — Backend Routes** artifact (the `forgot-password`, `verify-reset`, and `reset-password` routes).
+
+**Step 4: Push to Railway**
+
+If you deployed via GitHub, just commit and push:
+```
+git add .
+git commit -m "add password reset"
+git push
 `);
 
 // ═══════════════════════════════════════════

@@ -455,6 +455,57 @@ app.post("/api/bet", auth, (req, res) => {
   res.json({ success: true, betId: id, newBalance: member.balance - wager });
 });
 
+// Pool activity feed — pending bets with hidden details until game starts
+app.get("/api/pools/:poolId/activity", auth, (req, res) => {
+  const member = db.prepare("SELECT * FROM pool_members WHERE pool_id=? AND user_id=? AND status='active'").get(req.params.poolId, req.user.id);
+  if (!member) return res.status(403).json({ error: "Not in pool" });
+
+  const bets = db.prepare(`
+    SELECT b.id, b.bet_type, b.pick, b.line, b.odds, b.wager, b.result, b.payout,
+           b.parlay_group, b.created_at, b.member_id, b.game_id,
+           g.home_team, g.away_team, g.commence_time, g.status as game_status,
+           g.home_score, g.away_score,
+           u.display_name, u.username
+    FROM bets b
+    JOIN games g ON b.game_id = g.id
+    JOIN pool_members pm ON b.member_id = pm.id
+    JOIN users u ON pm.user_id = u.id
+    WHERE b.pool_id = ?
+    ORDER BY b.created_at DESC
+  `).all(req.params.poolId);
+
+  const now = new Date();
+  const processed = bets.map(bet => {
+    const gameStarted = new Date(bet.commence_time) <= now || bet.game_status !== "upcoming";
+    const isOwn = bet.member_id === member.id;
+    return {
+      id: bet.id,
+      display_name: bet.display_name,
+      username: bet.username,
+      wager: bet.wager,
+      result: bet.result,
+      payout: bet.payout,
+      created_at: bet.created_at,
+      parlay_group: bet.parlay_group,
+      game_id: bet.game_id,
+      game_status: bet.game_status,
+      commence_time: bet.commence_time,
+      home_team: bet.home_team,
+      away_team: bet.away_team,
+      home_score: bet.home_score,
+      away_score: bet.away_score,
+      revealed: gameStarted || isOwn,
+      bet_type: (gameStarted || isOwn) ? bet.bet_type : null,
+      pick: (gameStarted || isOwn) ? bet.pick : null,
+      line: (gameStarted || isOwn) ? bet.line : null,
+      odds: (gameStarted || isOwn) ? bet.odds : null,
+      is_own: isOwn,
+    };
+  });
+
+  res.json(processed);
+});
+
 app.get("/api/pools/:poolId/my-bets", auth, (req, res) => {
   const member = db.prepare("SELECT * FROM pool_members WHERE pool_id=? AND user_id=?").get(req.params.poolId, req.user.id);
   if (!member) return res.status(403).json({ error: "Not in pool" });
@@ -467,10 +518,12 @@ app.get("/api/pools/:poolId/leaderboard", (req, res) => {
     SELECT pm.balance, pm.status, pm.role, u.display_name, u.username,
       (SELECT COUNT(*) FROM bets WHERE member_id=pm.id AND result='win') as wins,
       (SELECT COUNT(*) FROM bets WHERE member_id=pm.id AND result='loss') as losses,
-      (SELECT COUNT(*) FROM bets WHERE member_id=pm.id AND result='push') as pushes
+      (SELECT COUNT(*) FROM bets WHERE member_id=pm.id AND result='push') as pushes,
+      (SELECT COALESCE(SUM(wager), 0) FROM bets WHERE member_id=pm.id AND result='pending') as pending_amount,
+      (pm.balance + (SELECT COALESCE(SUM(wager), 0) FROM bets WHERE member_id=pm.id AND result='pending')) as display_balance
     FROM pool_members pm JOIN users u ON pm.user_id = u.id
     WHERE pm.pool_id = ? AND pm.status = 'active'
-    ORDER BY pm.balance DESC
+    ORDER BY (pm.balance + (SELECT COALESCE(SUM(wager), 0) FROM bets WHERE member_id=pm.id AND result='pending')) DESC
   `).all(req.params.poolId);
   res.json(lb);
 });

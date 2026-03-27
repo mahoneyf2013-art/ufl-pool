@@ -6,6 +6,7 @@ const jwt = require("jsonwebtoken");
 const cron = require("node-cron");
 
 const app = express();
+console.log("DB URL:", process.env.DATABASE_URL ? "SET" : "NOT SET");
 app.use(cors());
 app.use(express.json());
 

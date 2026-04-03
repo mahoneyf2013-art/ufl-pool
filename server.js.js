@@ -383,29 +383,94 @@ async function gradeBets() {
 app.get("/api/games", async (req, res) => { try { res.json(await q("SELECT * FROM games ORDER BY commence_time")); } catch(e) { res.status(500).json({error:"Server error"}); } });
 app.get("/api/games/upcoming", async (req, res) => { try { res.json(await q("SELECT * FROM games WHERE status='upcoming' ORDER BY commence_time")); } catch(e) { res.status(500).json({error:"Server error"}); } });
 
-// Full schedule with all games
+// Full schedule — pull week info from ESPN
 app.get("/api/schedule", async (req, res) => {
   try {
-    const games = await q("SELECT * FROM games ORDER BY commence_time ASC");
-    // Group by week (derive from commence_time if week is null)
-    const weeks = {};
-    let weekNum = 1;
-    let lastWeekStart = null;
-    for (const game of games) {
-      const gameDate = new Date(game.commence_time);
-      const weekStart = new Date(gameDate);
-      weekStart.setDate(weekStart.getDate() - weekStart.getDay()); // Start of week (Sunday)
-      weekStart.setHours(0,0,0,0);
-      const weekKey = weekStart.toISOString().split("T")[0];
-      if (!lastWeekStart || weekKey !== lastWeekStart) {
-        if (lastWeekStart && weekKey !== lastWeekStart) weekNum++;
-        lastWeekStart = weekKey;
+    // Try ESPN for proper week numbers
+    let espnWeeks = [];
+    try {
+      // ESPN calendar gives us the week structure
+      const calRes = await fetch("https://site.api.espn.com/apis/site/v2/sports/football/ufl/scoreboard");
+      const calData = await calRes.json();
+      const currentWeek = calData.week?.number;
+      const totalWeeks = calData.leagues?.[0]?.calendar?.[0]?.entries?.length || 10;
+
+      // Fetch each week from ESPN
+      for (let w = 1; w <= totalWeeks; w++) {
+        try {
+          const wRes = await fetch(`https://site.api.espn.com/apis/site/v2/sports/football/ufl/scoreboard?week=${w}`);
+          const wData = await wRes.json();
+          if (wData.events && wData.events.length > 0) {
+            const games = wData.events.map(ev => {
+              const comp = ev.competitions?.[0];
+              const home = comp?.competitors?.find(c => c.homeAway === "home");
+              const away = comp?.competitors?.find(c => c.homeAway === "away");
+              const isComplete = comp?.status?.type?.completed || false;
+              return {
+                espn_id: ev.id,
+                name: ev.name,
+                date: ev.date,
+                home_team: home?.team?.displayName || home?.team?.name,
+                away_team: away?.team?.displayName || away?.team?.name,
+                home_abbr: home?.team?.abbreviation,
+                away_abbr: away?.team?.abbreviation,
+                home_score: isComplete ? parseInt(home?.score || 0) : null,
+                away_score: isComplete ? parseInt(away?.score || 0) : null,
+                home_record: home?.records?.[0]?.summary,
+                away_record: away?.records?.[0]?.summary,
+                status: isComplete ? "final" : comp?.status?.type?.name || "upcoming",
+                status_detail: comp?.status?.type?.shortDetail || "",
+                venue: comp?.venue?.fullName,
+              };
+            });
+            espnWeeks.push({ week: w, games });
+          }
+        } catch (e) { /* skip week if ESPN fails */ }
       }
-      const w = game.week || weekNum;
-      if (!weeks[w]) weeks[w] = { week: w, weekStart: weekKey, games: [] };
-      weeks[w].games.push(game);
+    } catch (e) {
+      console.error("ESPN schedule fetch failed:", e.message);
     }
-    res.json(Object.values(weeks).sort((a,b) => a.week - b.week));
+
+    // If ESPN worked, also merge in our odds data
+    if (espnWeeks.length > 0) {
+      const ourGames = await q("SELECT * FROM games ORDER BY commence_time");
+      // Match by team names and date proximity
+      for (const week of espnWeeks) {
+        for (const game of week.games) {
+          const match = ourGames.find(g => {
+            const nameMatch = (g.home_team === game.home_team || g.away_team === game.away_team ||
+              g.home_team?.includes(game.home_abbr) || g.away_team?.includes(game.away_abbr));
+            const dateClose = Math.abs(new Date(g.commence_time) - new Date(game.date)) < 86400000 * 2;
+            return nameMatch && dateClose;
+          });
+          if (match) {
+            game.odds_game_id = match.id;
+            game.spread_home = match.spread_home;
+            game.spread_away = match.spread_away;
+            game.total = match.total;
+            game.moneyline_home = match.moneyline_home;
+            game.moneyline_away = match.moneyline_away;
+            // Update week number in our DB
+            await pool.query("UPDATE games SET week=$1 WHERE id=$2", [week.week, match.id]);
+          }
+        }
+      }
+      return res.json(espnWeeks);
+    }
+
+    // Fallback: use our own games grouped by week from DB
+    const games = await q("SELECT * FROM games ORDER BY commence_time ASC");
+    const weeks = {};
+    for (const game of games) {
+      const w = game.week || 1;
+      if (!weeks[w]) weeks[w] = { week: w, games: [] };
+      weeks[w].games.push({
+        ...game, home_abbr: game.home_team?.split(" ").pop()?.substring(0,3)?.toUpperCase(),
+        away_abbr: game.away_team?.split(" ").pop()?.substring(0,3)?.toUpperCase(),
+        date: game.commence_time, status_detail: game.status,
+      });
+    }
+    res.json(Object.values(weeks).sort((a, b) => a.week - b.week));
   } catch (err) { console.error(err); res.status(500).json({ error: "Server error" }); }
 });
 
@@ -524,23 +589,59 @@ app.get("/api/pools/:poolId/live", auth, async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: "Server error" }); }
 });
 
-// ═══ ESPN PROXY — team/game info ═══
-app.get("/api/espn/scoreboard", async (req, res) => {
-  try {
-    const r = await fetch("https://site.api.espn.com/apis/site/v2/sports/football/ufl/scoreboard");
-    if (!r.ok) return res.status(502).json({ error: "ESPN unavailable" });
-    res.json(await r.json());
-  } catch (err) { res.status(502).json({ error: "ESPN unavailable" }); }
-});
+// ═══ ESPN PROXY — rich team/game data ═══
 
+// All teams with logos, colors, records
 app.get("/api/espn/teams", async (req, res) => {
   try {
     const r = await fetch("https://site.api.espn.com/apis/site/v2/sports/football/ufl/teams");
     if (!r.ok) return res.status(502).json({ error: "ESPN unavailable" });
+    const data = await r.json();
+    // Flatten into useful format
+    const teams = (data.sports?.[0]?.leagues?.[0]?.teams || []).map(t => {
+      const team = t.team;
+      return {
+        id: team.id, name: team.displayName, abbr: team.abbreviation,
+        shortName: team.shortDisplayName, nickname: team.name,
+        color: team.color ? `#${team.color}` : "#666",
+        altColor: team.alternateColor ? `#${team.alternateColor}` : "#333",
+        logo: team.logos?.[0]?.href || null,
+        record: team.record?.items?.[0]?.summary || null,
+        location: team.location,
+      };
+    });
+    res.json(teams);
+  } catch (err) { res.status(502).json({ error: "ESPN unavailable" }); }
+});
+
+// Single team detail
+app.get("/api/espn/teams/:teamId", async (req, res) => {
+  try {
+    const r = await fetch(`https://site.api.espn.com/apis/site/v2/sports/football/ufl/teams/${req.params.teamId}`);
+    if (!r.ok) return res.status(502).json({ error: "ESPN unavailable" });
     res.json(await r.json());
   } catch (err) { res.status(502).json({ error: "ESPN unavailable" }); }
 });
 
+// Team roster
+app.get("/api/espn/teams/:teamId/roster", async (req, res) => {
+  try {
+    const r = await fetch(`https://site.api.espn.com/apis/site/v2/sports/football/ufl/teams/${req.params.teamId}/roster`);
+    if (!r.ok) return res.status(502).json({ error: "ESPN unavailable" });
+    res.json(await r.json());
+  } catch (err) { res.status(502).json({ error: "ESPN unavailable" }); }
+});
+
+// Team schedule
+app.get("/api/espn/teams/:teamId/schedule", async (req, res) => {
+  try {
+    const r = await fetch(`https://site.api.espn.com/apis/site/v2/sports/football/ufl/teams/${req.params.teamId}/schedule`);
+    if (!r.ok) return res.status(502).json({ error: "ESPN unavailable" });
+    res.json(await r.json());
+  } catch (err) { res.status(502).json({ error: "ESPN unavailable" }); }
+});
+
+// Standings
 app.get("/api/espn/standings", async (req, res) => {
   try {
     const r = await fetch("https://site.api.espn.com/apis/v2/sports/football/ufl/standings");
@@ -549,9 +650,172 @@ app.get("/api/espn/standings", async (req, res) => {
   } catch (err) { res.status(502).json({ error: "ESPN unavailable" }); }
 });
 
+// News
+app.get("/api/espn/news", async (req, res) => {
+  try {
+    const r = await fetch("https://site.api.espn.com/apis/site/v2/sports/football/ufl/news");
+    if (!r.ok) return res.status(502).json({ error: "ESPN unavailable" });
+    res.json(await r.json());
+  } catch (err) { res.status(502).json({ error: "ESPN unavailable" }); }
+});
+
+// Scoreboard (live/current)
+app.get("/api/espn/scoreboard", async (req, res) => {
+  try {
+    const week = req.query.week ? `?week=${req.query.week}` : "";
+    const r = await fetch(`https://site.api.espn.com/apis/site/v2/sports/football/ufl/scoreboard${week}`);
+    if (!r.ok) return res.status(502).json({ error: "ESPN unavailable" });
+    res.json(await r.json());
+  } catch (err) { res.status(502).json({ error: "ESPN unavailable" }); }
+});
+
+// Game summary (box score, stats, play-by-play)
+app.get("/api/espn/summary/:eventId", async (req, res) => {
+  try {
+    const r = await fetch(`https://site.api.espn.com/apis/site/v2/sports/football/ufl/summary?event=${req.params.eventId}`);
+    if (!r.ok) return res.status(502).json({ error: "ESPN unavailable" });
+    res.json(await r.json());
+  } catch (err) { res.status(502).json({ error: "ESPN unavailable" }); }
+});
+
 // ═══ ADMIN TRIGGERS ═══
 app.post("/api/admin/refresh-odds", auth, async (req, res) => { const c = await fetchOdds(); res.json({ success: true, gamesUpdated: c }); });
 app.post("/api/admin/refresh-scores", auth, async (req, res) => { await fetchScores(); res.json({ success: true }); });
+
+// ═══ PLAYER PROFILE / STATS ═══
+app.get("/api/pools/:poolId/profile", auth, async (req, res) => {
+  try {
+    const member = await q1("SELECT * FROM pool_members WHERE pool_id=$1 AND user_id=$2", [req.params.poolId, req.user.id]);
+    if (!member) return res.status(403).json({ error: "Not in pool" });
+    const user = await q1("SELECT username, display_name FROM users WHERE id=$1", [req.user.id]);
+
+    const stats = await q1(`SELECT
+      COUNT(*) as total_bets,
+      COUNT(*) FILTER (WHERE result='win') as wins,
+      COUNT(*) FILTER (WHERE result='loss') as losses,
+      COUNT(*) FILTER (WHERE result='push') as pushes,
+      COUNT(*) FILTER (WHERE result='pending') as pending,
+      COALESCE(SUM(wager),0) as total_wagered,
+      COALESCE(SUM(payout),0) as total_payout,
+      COALESCE(SUM(wager) FILTER (WHERE result='pending'),0) as pending_amount,
+      COALESCE(SUM(CASE WHEN result='win' THEN payout - wager WHEN result='loss' THEN -wager ELSE 0 END),0) as net_profit,
+      COALESCE(AVG(wager),0) as avg_wager
+    FROM bets WHERE member_id=$1 AND parlay_group IS NULL`, [member.id]);
+
+    // Bet type breakdown
+    const byType = await q(`SELECT bet_type,
+      COUNT(*) as total, COUNT(*) FILTER (WHERE result='win') as wins,
+      COUNT(*) FILTER (WHERE result='loss') as losses
+    FROM bets WHERE member_id=$1 AND parlay_group IS NULL GROUP BY bet_type`, [member.id]);
+
+    // Parlay stats
+    const parlayStats = await q1(`SELECT
+      COUNT(DISTINCT parlay_group) as total_parlays,
+      COUNT(DISTINCT parlay_group) FILTER (WHERE result='win') as parlay_wins
+    FROM bets WHERE member_id=$1 AND parlay_group IS NOT NULL`, [member.id]);
+
+    // Recent bets
+    const recent = await q(`SELECT b.*, g.home_team, g.away_team, g.home_score, g.away_score
+      FROM bets b JOIN games g ON b.game_id=g.id
+      WHERE b.member_id=$1 ORDER BY b.created_at DESC LIMIT 10`, [member.id]);
+
+    // Streak
+    const graded = await q(`SELECT result FROM bets WHERE member_id=$1 AND result IN ('win','loss') AND parlay_group IS NULL ORDER BY created_at DESC LIMIT 20`, [member.id]);
+    let streak = 0, streakType = "";
+    if (graded.length > 0) {
+      streakType = graded[0].result;
+      for (const b of graded) { if (b.result === streakType) streak++; else break; }
+    }
+
+    const winRate = stats.total_bets > 0 ? ((parseInt(stats.wins) / (parseInt(stats.wins) + parseInt(stats.losses))) * 100) : 0;
+    const roi = parseInt(stats.total_wagered) > 0 ? ((parseInt(stats.net_profit) / parseInt(stats.total_wagered)) * 100) : 0;
+
+    res.json({
+      username: user.username, display_name: user.display_name,
+      balance: member.balance, role: member.role,
+      stats: { ...stats, win_rate: Math.round(winRate * 10) / 10, roi: Math.round(roi * 10) / 10 },
+      byType, parlayStats, recent,
+      streak: { count: streak, type: streakType },
+    });
+  } catch (err) { console.error(err); res.status(500).json({ error: "Server error" }); }
+});
+
+// ═══ WEEKLY RECAP ═══
+app.get("/api/pools/:poolId/recap/:week", auth, async (req, res) => {
+  try {
+    const member = await q1("SELECT * FROM pool_members WHERE pool_id=$1 AND user_id=$2 AND status='active'", [req.params.poolId, req.user.id]);
+    if (!member) return res.status(403).json({ error: "Not in pool" });
+    const week = parseInt(req.params.week);
+
+    // Get games for this week
+    const games = await q("SELECT * FROM games WHERE week=$1 ORDER BY commence_time", [week]);
+
+    // Get all bets for this week in this pool
+    const weekBets = await q(`SELECT b.*, g.home_team, g.away_team, g.home_score, g.away_score, g.week,
+      u.display_name, pm.balance
+      FROM bets b JOIN games g ON b.game_id=g.id JOIN pool_members pm ON b.member_id=pm.id JOIN users u ON pm.user_id=u.id
+      WHERE b.pool_id=$1 AND g.week=$2 ORDER BY b.wager DESC`, [req.params.poolId, week]);
+
+    // Player summaries for the week
+    const playerSummaries = await q(`SELECT u.display_name, pm.balance,
+      COUNT(*) FILTER (WHERE b.result='win') as wins,
+      COUNT(*) FILTER (WHERE b.result='loss') as losses,
+      COALESCE(SUM(CASE WHEN b.result='win' THEN b.payout - b.wager WHEN b.result='loss' THEN -b.wager ELSE 0 END),0) as week_profit
+      FROM bets b JOIN games g ON b.game_id=g.id JOIN pool_members pm ON b.member_id=pm.id JOIN users u ON pm.user_id=u.id
+      WHERE b.pool_id=$1 AND g.week=$2 AND b.result != 'pending'
+      GROUP BY u.display_name, pm.balance ORDER BY week_profit DESC`, [req.params.poolId, week]);
+
+    // Biggest win/loss
+    const bigWin = await q1(`SELECT b.wager, b.payout, b.bet_type, b.pick, b.line, u.display_name
+      FROM bets b JOIN pool_members pm ON b.member_id=pm.id JOIN users u ON pm.user_id=u.id JOIN games g ON b.game_id=g.id
+      WHERE b.pool_id=$1 AND g.week=$2 AND b.result='win' ORDER BY (b.payout - b.wager) DESC LIMIT 1`, [req.params.poolId, week]);
+
+    const bigLoss = await q1(`SELECT b.wager, b.bet_type, b.pick, b.line, u.display_name
+      FROM bets b JOIN pool_members pm ON b.member_id=pm.id JOIN users u ON pm.user_id=u.id JOIN games g ON b.game_id=g.id
+      WHERE b.pool_id=$1 AND g.week=$2 AND b.result='loss' ORDER BY b.wager DESC LIMIT 1`, [req.params.poolId, week]);
+
+    res.json({ week, games, bets: weekBets, playerSummaries, bigWin, bigLoss });
+  } catch (err) { console.error(err); res.status(500).json({ error: "Server error" }); }
+});
+
+// ═══ CSV EXPORTS ═══
+app.get("/api/pools/:poolId/export/standings", auth, async (req, res) => {
+  try {
+    const lb = await q(`SELECT u.display_name, u.username, pm.balance, pm.role,
+      (SELECT COUNT(*) FROM bets WHERE member_id=pm.id AND result='win') as wins,
+      (SELECT COUNT(*) FROM bets WHERE member_id=pm.id AND result='loss') as losses,
+      (SELECT COUNT(*) FROM bets WHERE member_id=pm.id AND result='push') as pushes,
+      (SELECT COALESCE(SUM(wager),0) FROM bets WHERE member_id=pm.id AND result='pending') as pending,
+      (pm.balance + (SELECT COALESCE(SUM(wager),0) FROM bets WHERE member_id=pm.id AND result='pending')) as display_balance
+      FROM pool_members pm JOIN users u ON pm.user_id=u.id
+      WHERE pm.pool_id=$1 AND pm.status='active'
+      ORDER BY display_balance DESC`, [req.params.poolId]);
+    let csv = "Rank,Name,Username,Balance,Display Balance,Wins,Losses,Pushes,Pending,Role\n";
+    lb.forEach((p, i) => {
+      csv += `${i + 1},"${p.display_name}",${p.username},${p.balance},${p.display_balance},${p.wins},${p.losses},${p.pushes},${p.pending},${p.role}\n`;
+    });
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", "attachment; filename=standings.csv");
+    res.send(csv);
+  } catch (err) { res.status(500).json({ error: "Server error" }); }
+});
+
+app.get("/api/pools/:poolId/export/bets", auth, async (req, res) => {
+  try {
+    const member = await q1("SELECT * FROM pool_members WHERE pool_id=$1 AND user_id=$2", [req.params.poolId, req.user.id]);
+    if (!member) return res.status(403).json({ error: "Not in pool" });
+    const bets = await q(`SELECT b.*, g.home_team, g.away_team, g.home_score, g.away_score, g.week, g.commence_time
+      FROM bets b JOIN games g ON b.game_id=g.id WHERE b.member_id=$1 ORDER BY b.created_at DESC`, [member.id]);
+    let csv = "Date,Week,Game,Type,Pick,Line,Odds,Wager,Result,Payout,Profit\n";
+    for (const b of bets) {
+      const profit = b.result === "win" ? b.payout - b.wager : b.result === "loss" ? -b.wager : 0;
+      csv += `"${new Date(b.created_at).toLocaleDateString()}",${b.week||""},"${b.away_team} @ ${b.home_team}",${b.bet_type},"${b.pick}",${b.line||""},${b.odds||""},${b.wager},${b.result},${b.payout},${profit}\n`;
+    }
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", "attachment; filename=my-bets.csv");
+    res.send(csv);
+  } catch (err) { res.status(500).json({ error: "Server error" }); }
+});
 
 // ═══ HEALTH ═══
 app.get("/", (req, res) => { res.json({ status: "ok", app: "UFL Fantasy Sportsbook Pool", oddsApiConfigured: !!ODDS_API_KEY }); });

@@ -180,11 +180,17 @@ async function gradeBets(){
           if(l.bet_type==="moneyline"&&l.odds){
             const o=l.odds;
             mt*=o<0?1+100/Math.abs(o):1+o/100;
-          }else mt*=1.909;
+          }else{
+            // Spread/total at -110: decimal odds = 1.909
+            const o=l.odds||-110;
+            mt*=o<0?1+100/Math.abs(o):1+o/100;
+          }
         }
         // Push legs don't multiply — they're just removed from the parlay effectively
       }
       const pp=Math.round(legs[0].wager*mt);
+      // FIX: Update payout on the first leg record so UI can display it
+      await pool.query("UPDATE bets SET payout=$1 WHERE id=$2",[pp,legs[0].id]);
       if(pp>0)await pool.query("UPDATE pool_members SET balance=balance+$1 WHERE id=$2",[pp,legs[0].member_id]);
       console.log("Parlay "+pg+" won! Payout: "+pp);
     }
@@ -197,13 +203,33 @@ app.get("/api/games",async(rq,rs)=>{try{rs.json(await q("SELECT * FROM games ORD
 app.get("/api/games/upcoming",async(rq,rs)=>{try{rs.json(await q("SELECT * FROM games WHERE status='upcoming' ORDER BY commence_time"));}catch(e){rs.status(500).json({error:"Server error"});}});
 app.get("/api/games/:gameId/line-history",async(rq,rs)=>{try{const h=await q("SELECT * FROM line_history WHERE game_id=$1 ORDER BY recorded_at ASC",[rq.params.gameId]);const g=await q1("SELECT * FROM games WHERE id=$1",[rq.params.gameId]);rs.json({history:h,current:g});}catch(e){rs.status(500).json({error:"Server error"});}});
 
-app.post("/api/bet",auth,async(rq,rs)=>{try{const{pool_id,game_id,bet_type,pick,line,odds,wager,parlay_group}=rq.body;const m=await q1("SELECT * FROM pool_members WHERE pool_id=$1 AND user_id=$2 AND status='active'",[pool_id,rq.user.id]);if(!m)return rs.status(403).json({error:"Not active"});const g=await q1("SELECT * FROM games WHERE id=$1",[game_id]);if(!g)return rs.status(404).json({error:"Game not found"});if(g.status!=="upcoming")return rs.status(400).json({error:"Game started"});if(new Date(g.commence_time)<=new Date())return rs.status(400).json({error:"Betting closed"});if(!wager||wager<=0)return rs.status(400).json({error:"Invalid wager"});if(wager>m.balance)return rs.status(400).json({error:"Insufficient balance"});await pool.query("UPDATE pool_members SET balance=balance-$1 WHERE id=$2",[wager,m.id]);const id=uuid();await pool.query("INSERT INTO bets(id,member_id,pool_id,game_id,bet_type,pick,line,odds,wager,parlay_group)VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",[id,m.id,pool_id,game_id,bet_type,pick,line,odds,wager,parlay_group||null]);rs.json({success:true,betId:id,newBalance:m.balance-wager});}catch(e){console.error(e);rs.status(500).json({error:"Server error"});}});
+app.post("/api/bet",auth,async(rq,rs)=>{try{const{pool_id,game_id,bet_type,pick,line,odds,wager,parlay_group,is_parlay_leg,parlay_leg_index}=rq.body;const m=await q1("SELECT * FROM pool_members WHERE pool_id=$1 AND user_id=$2 AND status='active'",[pool_id,rq.user.id]);if(!m)return rs.status(403).json({error:"Not active"});const g=await q1("SELECT * FROM games WHERE id=$1",[game_id]);if(!g)return rs.status(404).json({error:"Game not found"});if(g.status!=="upcoming")return rs.status(400).json({error:"Game started"});if(new Date(g.commence_time)<=new Date())return rs.status(400).json({error:"Betting closed"});if(!wager||wager<=0)return rs.status(400).json({error:"Invalid wager"});
+// FIX: For parlay legs, only deduct the wager on the FIRST leg (index 0).
+// All legs share the same wager amount but it's one bet, not N bets.
+const shouldDeduct=!parlay_group||parlay_leg_index===0||parlay_leg_index===undefined;
+if(shouldDeduct){if(wager>m.balance)return rs.status(400).json({error:"Insufficient balance"});await pool.query("UPDATE pool_members SET balance=balance-$1 WHERE id=$2",[wager,m.id]);}
+const id=uuid();await pool.query("INSERT INTO bets(id,member_id,pool_id,game_id,bet_type,pick,line,odds,wager,parlay_group)VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",[id,m.id,pool_id,game_id,bet_type,pick,line,odds,wager,parlay_group||null]);
+const newBal=shouldDeduct?m.balance-wager:m.balance;
+rs.json({success:true,betId:id,newBalance:newBal});}catch(e){console.error(e);rs.status(500).json({error:"Server error"});}});
 
 app.get("/api/pools/:poolId/activity",auth,async(rq,rs)=>{try{const m=await q1("SELECT * FROM pool_members WHERE pool_id=$1 AND user_id=$2 AND status='active'",[rq.params.poolId,rq.user.id]);if(!m)return rs.status(403).json({error:"Not in pool"});const bets=await q(`SELECT b.id,b.bet_type,b.pick,b.line,b.odds,b.wager,b.result,b.payout,b.parlay_group,b.created_at,b.member_id,b.game_id,g.home_team,g.away_team,g.commence_time,g.status as game_status,g.home_score,g.away_score,u.display_name,u.username FROM bets b JOIN games g ON b.game_id=g.id JOIN pool_members pm ON b.member_id=pm.id JOIN users u ON pm.user_id=u.id WHERE b.pool_id=$1 ORDER BY b.created_at DESC`,[rq.params.poolId]);const now=new Date();rs.json(bets.map(b=>{const started=new Date(b.commence_time)<=now||b.game_status!=="upcoming";const own=b.member_id===m.id;const rev=started||own;return{id:b.id,display_name:b.display_name,username:b.username,wager:b.wager,result:b.result,payout:b.payout,created_at:b.created_at,parlay_group:b.parlay_group,game_id:b.game_id,game_status:b.game_status,commence_time:b.commence_time,is_own:own,revealed:rev,home_team:rev?b.home_team:null,away_team:rev?b.away_team:null,home_score:rev?b.home_score:null,away_score:rev?b.away_score:null,bet_type:rev?b.bet_type:null,pick:rev?b.pick:null,line:rev?b.line:null,odds:rev?b.odds:null};}));}catch(e){console.error(e);rs.status(500).json({error:"Server error"});}});
 
 app.get("/api/pools/:poolId/my-bets",auth,async(rq,rs)=>{try{const m=await q1("SELECT * FROM pool_members WHERE pool_id=$1 AND user_id=$2",[rq.params.poolId,rq.user.id]);if(!m)return rs.status(403).json({error:"Not in pool"});rs.json(await q("SELECT b.*,g.home_team,g.away_team,g.home_score,g.away_score,g.commence_time FROM bets b JOIN games g ON b.game_id=g.id WHERE b.member_id=$1 ORDER BY b.created_at DESC",[m.id]));}catch(e){console.error(e);rs.status(500).json({error:"Server error"});}});
 
-app.get("/api/pools/:poolId/leaderboard",async(rq,rs)=>{try{rs.json(await q(`SELECT pm.balance,pm.status,pm.role,u.display_name,u.username,(SELECT COUNT(*)FROM bets WHERE member_id=pm.id AND result='win')as wins,(SELECT COUNT(*)FROM bets WHERE member_id=pm.id AND result='loss')as losses,(SELECT COUNT(*)FROM bets WHERE member_id=pm.id AND result='push')as pushes,(SELECT COALESCE(SUM(wager),0)FROM bets WHERE member_id=pm.id AND result='pending')as pending_amount,(pm.balance+(SELECT COALESCE(SUM(wager),0)FROM bets WHERE member_id=pm.id AND result='pending'))as display_balance FROM pool_members pm JOIN users u ON pm.user_id=u.id WHERE pm.pool_id=$1 AND pm.status='active' ORDER BY(pm.balance+(SELECT COALESCE(SUM(wager),0)FROM bets WHERE member_id=pm.id AND result='pending'))DESC`,[rq.params.poolId]));}catch(e){console.error(e);rs.status(500).json({error:"Server error"});}});
+app.get("/api/pools/:poolId/leaderboard",async(rq,rs)=>{try{rs.json(await q(`SELECT pm.balance,pm.status,pm.role,u.display_name,u.username,
+(SELECT COUNT(*)FROM bets WHERE member_id=pm.id AND result='win')as wins,
+(SELECT COUNT(*)FROM bets WHERE member_id=pm.id AND result='loss')as losses,
+(SELECT COUNT(*)FROM bets WHERE member_id=pm.id AND result='push')as pushes,
+(SELECT COALESCE(SUM(wager),0) FROM (
+  SELECT DISTINCT ON(COALESCE(parlay_group,id)) wager FROM bets WHERE member_id=pm.id AND result='pending'
+) sub)as pending_amount,
+(pm.balance+(SELECT COALESCE(SUM(wager),0) FROM (
+  SELECT DISTINCT ON(COALESCE(parlay_group,id)) wager FROM bets WHERE member_id=pm.id AND result='pending'
+) sub2))as display_balance
+FROM pool_members pm JOIN users u ON pm.user_id=u.id WHERE pm.pool_id=$1 AND pm.status='active'
+ORDER BY(pm.balance+(SELECT COALESCE(SUM(wager),0) FROM (
+  SELECT DISTINCT ON(COALESCE(parlay_group,id)) wager FROM bets WHERE member_id=pm.id AND result='pending'
+) sub3))DESC`,[rq.params.poolId]));}catch(e){console.error(e);rs.status(500).json({error:"Server error"});}});
 
 // Fetch detailed live game info from ESPN (quarter, clock, situation, last play)
 async function fetchESPNLiveDetail(){

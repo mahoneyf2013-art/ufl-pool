@@ -292,6 +292,52 @@ app.get("/api/pools/:poolId/export/all-activity",authFlexible,async(rq,rs)=>{try
 app.post("/api/admin/refresh-odds",auth,async(rq,rs)=>{const c=await fetchOdds();rs.json({success:true,gamesUpdated:c});});
 app.post("/api/admin/refresh-scores",auth,async(rq,rs)=>{await fetchScores();await fetchESPNLiveScores();rs.json({success:true});});
 
+// Admin: manually finalize stuck games that have scores but wrong status
+app.post("/api/admin/finalize-games",auth,async(rq,rs)=>{try{
+  const stuck=await q("SELECT * FROM games WHERE status='upcoming' AND home_score IS NOT NULL AND away_score IS NOT NULL");
+  let fixed=0;
+  for(const g of stuck){
+    // Check if game time has passed (more than 4 hours ago = definitely over)
+    const gameTime=new Date(g.commence_time).getTime();
+    const now=Date.now();
+    if(now-gameTime>4*60*60*1000){
+      await pool.query("UPDATE games SET status='final' WHERE id=$1",[g.id]);
+      fixed++;
+      console.log("Finalized stuck game: "+g.away_team+" @ "+g.home_team+" ("+g.away_score+"-"+g.home_score+")");
+    }
+  }
+  if(fixed>0)await gradeBets();
+  rs.json({success:true,gamesFinalized:fixed,gamesChecked:stuck.length});
+}catch(e){console.error(e);rs.status(500).json({error:"Server error"});}});
+
+// Admin: force-import games from ESPN scoreboard (for when Odds API doesn't have them)
+app.post("/api/admin/import-espn-games",auth,async(rq,rs)=>{try{
+  const scr=await fetch("https://site.api.espn.com/apis/site/v2/sports/football/ufl/scoreboard");
+  if(!scr.ok)return rs.status(502).json({error:"ESPN unavailable"});
+  const data=await scr.json();
+  let imported=0;
+  for(const ev of(data.events||[])){
+    const c=ev.competitions?.[0];if(!c)continue;
+    const hm=c.competitors?.find(x=>x.homeAway==="home");
+    const aw=c.competitors?.find(x=>x.homeAway==="away");
+    if(!hm||!aw)continue;
+    const hmName=hm.team?.displayName,awName=aw.team?.displayName;
+    const done=c.status?.type?.completed||false;
+    // Check if we already have this game
+    const existing=await q1("SELECT * FROM games WHERE (home_team=$1 AND away_team=$2) OR (home_team LIKE $3 AND away_team LIKE $4)",[hmName,awName,`%${hm.team?.abbreviation}%`,`%${aw.team?.abbreviation}%`]);
+    if(!existing){
+      // Create a new game entry from ESPN data
+      const id="espn_"+ev.id;
+      await pool.query(`INSERT INTO games(id,commence_time,home_team,away_team,status,home_score,away_score,last_updated)VALUES($1,$2,$3,$4,$5,$6,$7,NOW()) ON CONFLICT(id) DO NOTHING`,[id,ev.date,hmName,awName,done?"final":"upcoming",done?parseInt(hm.score||0):null,done?parseInt(aw.score||0):null]);
+      imported++;
+      console.log("Imported from ESPN: "+awName+" @ "+hmName);
+    }
+  }
+  // Also try fetching from Odds API
+  const oddsCount=await fetchOdds();
+  rs.json({success:true,espnImported:imported,oddsRefreshed:oddsCount});
+}catch(e){console.error(e);rs.status(500).json({error:"Server error"});}});
+
 // ═══ HEALTH ═══
 app.get("/",(rq,rs)=>{rs.json({status:"ok",app:"UFL Fantasy Sportsbook Pool",version:"2.0",oddsApiConfigured:!!ODDS_API_KEY});});
 

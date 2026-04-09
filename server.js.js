@@ -323,19 +323,50 @@ app.post("/api/admin/import-espn-games",auth,async(rq,rs)=>{try{
     if(!hm||!aw)continue;
     const hmName=hm.team?.displayName,awName=aw.team?.displayName;
     const done=c.status?.type?.completed||false;
-    // Check if we already have this game
-    const existing=await q1("SELECT * FROM games WHERE (home_team=$1 AND away_team=$2) OR (home_team LIKE $3 AND away_team LIKE $4)",[hmName,awName,`%${hm.team?.abbreviation}%`,`%${aw.team?.abbreviation}%`]);
+    // Check if we already have this game (by team names + close date)
+    const existing=await q1(`SELECT * FROM games WHERE 
+      ((home_team=$1 AND away_team=$2) OR (home_team LIKE $3 AND away_team LIKE $4))
+      AND ABS(EXTRACT(EPOCH FROM (commence_time::timestamptz - $5::timestamptz))) < 172800`,
+      [hmName,awName,`%${hm.team?.abbreviation}%`,`%${aw.team?.abbreviation}%`,ev.date]);
     if(!existing){
-      // Create a new game entry from ESPN data
       const id="espn_"+ev.id;
       await pool.query(`INSERT INTO games(id,commence_time,home_team,away_team,status,home_score,away_score,last_updated)VALUES($1,$2,$3,$4,$5,$6,$7,NOW()) ON CONFLICT(id) DO NOTHING`,[id,ev.date,hmName,awName,done?"final":"upcoming",done?parseInt(hm.score||0):null,done?parseInt(aw.score||0):null]);
       imported++;
       console.log("Imported from ESPN: "+awName+" @ "+hmName);
     }
   }
-  // Also try fetching from Odds API
   const oddsCount=await fetchOdds();
   rs.json({success:true,espnImported:imported,oddsRefreshed:oddsCount});
+}catch(e){console.error(e);rs.status(500).json({error:"Server error"});}});
+
+// Admin: deduplicate games — remove ESPN-imported dupes when Odds API version exists
+app.post("/api/admin/dedupe-games",auth,async(rq,rs)=>{try{
+  const allGames=await q("SELECT * FROM games ORDER BY commence_time");
+  let removed=0;
+  for(let i=0;i<allGames.length;i++){
+    for(let j=i+1;j<allGames.length;j++){
+      const a=allGames[i],b=allGames[j];
+      // Check if same matchup (same teams, close dates)
+      const sameHome=a.home_team===b.home_team;
+      const sameAway=a.away_team===b.away_team;
+      const closeDate=Math.abs(new Date(a.commence_time)-new Date(b.commence_time))<172800000;
+      if(sameHome&&sameAway&&closeDate){
+        // Keep the one with odds, remove the other
+        const keepId=a.spread_home!=null||a.moneyline_home!=null?a.id:(b.spread_home!=null||b.moneyline_home!=null?b.id:a.id);
+        const removeId=keepId===a.id?b.id:a.id;
+        // Move any bets from the removed game to the kept game
+        await pool.query("UPDATE bets SET game_id=$1 WHERE game_id=$2",[keepId,removeId]);
+        // Delete the duplicate
+        await pool.query("DELETE FROM line_history WHERE game_id=$1",[removeId]);
+        await pool.query("DELETE FROM games WHERE id=$1",[removeId]);
+        removed++;
+        console.log("Deduped: removed "+removeId+" (kept "+keepId+") — "+a.away_team+" @ "+a.home_team);
+        // Remove from our working array so we don't double-process
+        allGames.splice(j,1);j--;
+      }
+    }
+  }
+  rs.json({success:true,duplicatesRemoved:removed});
 }catch(e){console.error(e);rs.status(500).json({error:"Server error"});}});
 
 // Admin: manually set or update lines for a game

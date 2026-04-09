@@ -338,6 +338,70 @@ app.post("/api/admin/import-espn-games",auth,async(rq,rs)=>{try{
   rs.json({success:true,espnImported:imported,oddsRefreshed:oddsCount});
 }catch(e){console.error(e);rs.status(500).json({error:"Server error"});}});
 
+// Admin: manually set or update lines for a game
+app.post("/api/admin/set-lines",auth,async(rq,rs)=>{try{
+  const{game_id,spread_home,spread_away,total,moneyline_home,moneyline_away}=rq.body;
+  if(!game_id)return rs.status(400).json({error:"game_id required"});
+  const g=await q1("SELECT * FROM games WHERE id=$1",[game_id]);
+  if(!g)return rs.status(404).json({error:"Game not found"});
+  // Record line history
+  await pool.query("INSERT INTO line_history(id,game_id,spread_home,spread_away,total,moneyline_home,moneyline_away)VALUES($1,$2,$3,$4,$5,$6,$7)",[uuid(),game_id,spread_home!=null?spread_home:g.spread_home,spread_away!=null?spread_away:g.spread_away,total!=null?total:g.total,moneyline_home!=null?moneyline_home:g.moneyline_home,moneyline_away!=null?moneyline_away:g.moneyline_away]);
+  // Update the game
+  const updates=[];const vals=[];let idx=1;
+  if(spread_home!=null){updates.push("spread_home=$"+idx);vals.push(spread_home);idx++;}
+  if(spread_away!=null){updates.push("spread_away=$"+idx);vals.push(spread_away);idx++;}
+  if(total!=null){updates.push("total=$"+idx);vals.push(total);idx++;}
+  if(moneyline_home!=null){updates.push("moneyline_home=$"+idx);vals.push(moneyline_home);idx++;}
+  if(moneyline_away!=null){updates.push("moneyline_away=$"+idx);vals.push(moneyline_away);idx++;}
+  if(updates.length===0)return rs.status(400).json({error:"No lines provided"});
+  updates.push("last_updated=NOW()");
+  vals.push(game_id);
+  await pool.query("UPDATE games SET "+updates.join(",")+" WHERE id=$"+idx,vals);
+  const updated=await q1("SELECT * FROM games WHERE id=$1",[game_id]);
+  rs.json({success:true,game:updated});
+}catch(e){console.error(e);rs.status(500).json({error:"Server error"});}});
+
+// Admin: diagnose Odds API — check available sports and find the correct UFL key
+app.get("/api/admin/odds-debug",auth,async(rq,rs)=>{try{
+  if(!ODDS_API_KEY)return rs.json({error:"No ODDS_API_KEY configured"});
+  // 1. Get all available sports
+  const sportsRes=await fetch(`https://api.the-odds-api.com/v4/sports/?apiKey=${ODDS_API_KEY}`);
+  const sportsData=await sportsRes.json();
+  const remaining=sportsRes.headers.get("x-requests-remaining");
+  const used=sportsRes.headers.get("x-requests-used");
+  // 2. Filter for anything football/UFL related
+  const footballSports=(sportsData||[]).filter(s=>
+    s.key?.includes("football")||s.key?.includes("ufl")||s.key?.includes("xfl")||
+    s.title?.toLowerCase().includes("ufl")||s.title?.toLowerCase().includes("football")||
+    s.group?.toLowerCase().includes("football")
+  );
+  // 3. Also try the current sport key
+  const currentKeyRes=await fetch(`https://api.the-odds-api.com/v4/sports/${SPORT}/odds/?apiKey=${ODDS_API_KEY}&regions=us&markets=h2h&oddsFormat=american`);
+  const currentKeyData=await currentKeyRes.json();
+  const currentKeyStatus=currentKeyRes.status;
+  // 4. Try some alternate keys
+  const altKeys=["americanfootball_ufl","americanfootball_xfl","americanfootball_usfl","football_ufl"];
+  const altResults={};
+  for(const ak of altKeys){
+    if(ak===SPORT)continue;
+    try{
+      const ar=await fetch(`https://api.the-odds-api.com/v4/sports/${ak}/odds/?apiKey=${ODDS_API_KEY}&regions=us&markets=h2h&oddsFormat=american`);
+      altResults[ak]={status:ar.status,count:ar.ok?(await ar.json()).length:0};
+    }catch(e){altResults[ak]={status:"error",error:e.message};}
+  }
+  rs.json({
+    currentSportKey:SPORT,
+    currentKeyStatus,
+    currentKeyGames:Array.isArray(currentKeyData)?currentKeyData.length:0,
+    currentKeyError:currentKeyData?.message||null,
+    apiQuota:{remaining,used},
+    allFootballSports:footballSports,
+    allSportsCount:(sportsData||[]).length,
+    alternateKeyResults:altResults,
+    allSports:(sportsData||[]).map(s=>({key:s.key,title:s.title,group:s.group,active:s.active}))
+  });
+}catch(e){console.error(e);rs.status(500).json({error:e.message});}});
+
 // ═══ HEALTH ═══
 app.get("/",(rq,rs)=>{rs.json({status:"ok",app:"UFL Fantasy Sportsbook Pool",version:"2.0",oddsApiConfigured:!!ODDS_API_KEY});});
 
